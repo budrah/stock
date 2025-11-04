@@ -2,94 +2,185 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
-import time
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import requests, string
+import time, requests, string, io
 from urllib.parse import quote
 
 st.set_page_config(page_title="IDX Stock Screener", page_icon="📈", layout="wide")
 
 st.title("📈 IDX Stock Screener")
-st.markdown("**Filter saham dengan parameter yang dapat disesuaikan: persentase kenaikan, jumlah hari berturut-turut, dan volume perdagangan**")
+st.markdown("**Filter saham: % kenaikan, jumlah hari berturut-turut, dan volume perdagangan**")
 
-# --------- DYNAMIC TICKER SOURCES ----------
-@st.cache_data(ttl=3600)
-def fetch_from_idx():
-    """Fetch daftar emiten dari situs IDX (JSON used by the site)."""
-    url = "https://www.idx.co.id/umbraco/Surface/ListedCompany/GetListedCompany?emitenType=s"
-    try:
-        r = requests.get(url, headers={"Referer": "https://www.idx.co.id/"}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        return [], {}
+# ---------- Small static fallback (agar tak pernah 0) ----------
+STATIC_FALLBACK = [
+    "BBCA.JK","BBRI.JK","BMRI.JK","BBNI.JK","TLKM.JK","ASII.JK","UNVR.JK","HMSP.JK","ICBP.JK","KLBF.JK",
+    "INDF.JK","GGRM.JK","UNTR.JK","ADRO.JK","PTBA.JK","ANTM.JK","TOWR.JK","ISAT.JK","EXCL.JK","PGAS.JK"
+]
 
-    tickers, names = [], {}
-    if isinstance(data, list):
-        for row in data:
-            code = str(row.get("KodeEmiten", "")).strip().upper()
-            name = (row.get("NamaEmiten") or row.get("NamaPerusahaan") or code).strip()
-            if code:
-                sym = f"{code}.JK"
-                tickers.append(sym)
-                names[sym] = name
-    return sorted(set(tickers)), names
-
-@st.cache_data(ttl=3600)
-def fetch_from_yahoo():
-    """Sweep Yahoo autocomplete A–Z & 0–9; keep only .JK / JKT symbols."""
-    base = "https://autoc.finance.yahoo.com/autoc?region=1&lang=en&query="
-    tickers, names = set(), {}
-    for q in list(string.ascii_uppercase) + list(string.digits):
-        try:
-            r = requests.get(base + quote(q), timeout=10)
-            if r.status_code != 200:
-                continue
-            js = r.json()
-            for it in js.get("ResultSet", {}).get("Result", []):
-                sym = (it.get("symbol") or "").upper()
-                exch = (it.get("exch") or "").upper()
-                if sym.endswith(".JK") or exch == "JKT":
-                    tickers.add(sym)
-                    names[sym] = it.get("name") or sym
-        except Exception:
-            pass
-        time.sleep(0.08)  # be nice to the API
-    return sorted(tickers), names
-
-def resolve_tickers(source_mode: str):
-    """
-    source_mode: 'Auto' (IDX -> Yahoo), 'IDX only', 'Yahoo only'
-    returns (symbols_list, symbol_to_name_map)
-    """
-    if source_mode == "IDX only":
-        syms, names = fetch_from_idx()
-        return syms, names
-    if source_mode == "Yahoo only":
-        syms, names = fetch_from_yahoo()
-        return syms, names
-
-    # Auto: try IDX first, then Yahoo as fallback
-    syms, names = fetch_from_idx()
-    if len(syms) >= 200:
-        return syms, names
-    syms2, names2 = fetch_from_yahoo()
-    return syms2, names2
-
-# --------- Utility & indicators (unchanged from your code) ----------
+# ---------- Helpers ----------
 def format_idr(value):
     if pd.isna(value) or value == 0:
         return "Rp 0"
-    if value >= 1_000_000_000_000:  # T
+    if value >= 1_000_000_000_000:
         return f"Rp {value/1_000_000_000_000:.2f} T"
-    elif value >= 1_000_000_000:     # M (miliar)
+    elif value >= 1_000_000_000:
         return f"Rp {value/1_000_000_000:.2f} M"
-    elif value >= 1_000_000:         # Jt
+    elif value >= 1_000_000:
         return f"Rp {value/1_000_000:.2f} Jt"
     else:
         return f"Rp {value:,.0f}"
 
+def _try_get_json(url, params=None, headers=None, timeout=15):
+    try:
+        r = requests.get(url, params=params or {}, headers=headers or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+def _clean_to_jk_symbol(s: str) -> str:
+    s = (s or "").strip().upper()
+    if not s:
+        return ""
+    if s.endswith(".JK"):
+        return s
+    # buang spasi/komentar
+    s = s.split()[0].strip()
+    # buang tanda baca umum
+    s = s.replace(",", "").replace(";", "").replace(".", "")
+    if not s:
+        return ""
+    return s + ".JK"
+
+# ---------- Yahoo search (lebih stabil) ----------
+YA_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search"
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+@st.cache_data(ttl=3600)
+def fetch_from_yahoo_search_verbose():
+    tickers = {}
+    errors = []
+    queries = list(string.ascii_uppercase) + list(string.digits)
+
+    for q in queries:
+        js, err = _try_get_json(
+            YA_SEARCH,
+            params={"q": q, "quotesCount": 1000, "newsCount": 0, "lang": "en-US", "region": "US"},
+            headers=BROWSER_HEADERS,
+            timeout=12
+        )
+        if err or not js:
+            errors.append(f"Yahoo {q}: {err or 'no data'}")
+            time.sleep(0.05)
+            continue
+
+        for it in (js.get("quotes") or []):
+            sym = (it.get("symbol") or "").upper()
+            exch = (it.get("exchange") or it.get("exch") or "").upper()
+            exch_disp = (it.get("exchDisp") or it.get("exchangeDisp") or "").lower()
+            name = it.get("shortname") or it.get("longname") or it.get("name") or sym
+            if sym.endswith(".JK") or exch in {"JKT", "JAKARTA", "IDX"} or "jakarta" in exch_disp:
+                tickers[sym] = name
+        time.sleep(0.08)
+
+    # light cleaning
+    cleaned = {}
+    for sym, name in tickers.items():
+        bad_suffix = any(suf in sym for suf in ["-W", "-R", "-B", "-TB", "-F", "-P", "-S", "-Q"])
+        if bad_suffix:
+            continue
+        if len(sym) <= 3:
+            continue
+        cleaned[sym] = name
+
+    final_map = cleaned if cleaned else tickers
+    return sorted(final_map.keys()), final_map, errors
+
+# ---------- IDX fetch (kadang 403/blocked di Replit) ----------
+@st.cache_data(ttl=3600)
+def fetch_from_idx_verbose():
+    url = "https://www.idx.co.id/umbraco/Surface/ListedCompany/GetListedCompany?emitenType=s"
+    js, err = _try_get_json(url, headers={"Referer": "https://www.idx.co.id/"}, timeout=15)
+    if err or not isinstance(js, list):
+        return [], {}, [f"IDX: {err or 'no data/list'}"]
+    syms, names = [], {}
+    for row in js:
+        code = str(row.get("KodeEmiten") or "").strip().upper()
+        name = (row.get("NamaEmiten") or row.get("NamaPerusahaan") or code).strip()
+        if code and code.isalnum():
+            sym = f"{code}.JK"
+            syms.append(sym); names[sym] = name
+    syms = sorted(set(syms))
+    return syms, names, []
+
+# ---------- Manual (Upload/Tempel) ----------
+def fetch_from_manual(text_value: str, uploaded_file) -> tuple[list, dict]:
+    symbols = []
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.lower().endswith(".csv"):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
+            # cari kolom yang memuat kode (heuristik sederhana)
+            candidate_cols = [c for c in df.columns if "code" in c.lower() or "ticker" in c.lower() or "symbol" in c.lower() or "kode" in c.lower()]
+            if not candidate_cols:
+                candidate_cols = [df.columns[0]]
+            codes = df[candidate_cols[0]].astype(str).tolist()
+            symbols.extend([_clean_to_jk_symbol(c) for c in codes])
+        except Exception:
+            pass
+    # gabung teks manual
+    if text_value:
+        lines = [ln.strip() for ln in text_value.splitlines() if ln.strip()]
+        symbols.extend([_clean_to_jk_symbol(ln) for ln in lines])
+    # bersihkan
+    symbols = sorted({s for s in symbols if s.endswith(".JK") and len(s) >= 5})
+    name_map = {s: s.replace(".JK", "") for s in symbols}
+    return symbols, name_map
+
+# ---------- Resolve universe ----------
+def resolve_universe(mode: str, manual_text: str = "", manual_file=None):
+    debug_msgs = []
+    if mode == "Yahoo only":
+        syms, names, errs = fetch_from_yahoo_search_verbose()
+        debug_msgs.extend(errs)
+        if not syms:
+            debug_msgs.append("Yahoo empty → fallback STATIC")
+            return STATIC_FALLBACK, {s: s.replace(".JK", "") for s in STATIC_FALLBACK}, debug_msgs
+        return syms, names, debug_msgs
+
+    if mode == "IDX only":
+        syms, names, errs = fetch_from_idx_verbose()
+        debug_msgs.extend(errs)
+        if not syms:
+            debug_msgs.append("IDX empty → fallback STATIC")
+            return STATIC_FALLBACK, {s: s.replace(".JK", "") for s in STATIC_FALLBACK}, debug_msgs
+        return syms, names, debug_msgs
+
+    if mode == "Manual":
+        syms, names = fetch_from_manual(manual_text, manual_file)
+        if not syms:
+            debug_msgs.append("Manual empty → fallback STATIC")
+            return STATIC_FALLBACK, {s: s.replace(".JK", "") for s in STATIC_FALLBACK}, debug_msgs
+        return syms, names, debug_msgs
+
+    # Auto: Yahoo → IDX → STATIC
+    syms, names, errs = fetch_from_yahoo_search_verbose()
+    debug_msgs.extend(errs)
+    if syms:
+        return syms, names, debug_msgs
+    syms2, names2, errs2 = fetch_from_idx_verbose()
+    debug_msgs.extend(errs2)
+    if syms2:
+        return syms2, names2, debug_msgs
+    debug_msgs.append("Auto empty → fallback STATIC")
+    return STATIC_FALLBACK, {s: s.replace(".JK", "") for s in STATIC_FALLBACK}, debug_msgs
+
+# ---------- Data & indicators ----------
 @st.cache_data(ttl=600, show_spinner=False)
 def get_stock_data(ticker, period="5d"):
     stock = yf.Ticker(ticker)
@@ -116,10 +207,8 @@ def check_consecutive_day_increase(hist, threshold=2.0, num_days=2):
 def calculate_trading_value(hist):
     if hist is None or len(hist) < 1:
         return 0
-    recent = hist.tail(1)
-    price = float(recent['Close'].values[0])
-    volume = float(recent['Volume'].values[0])
-    return price * volume
+    r = hist.tail(1)
+    return float(r['Close'].values[0]) * float(r['Volume'].values[0])
 
 def calculate_rsi(hist, period=14):
     if hist is None or len(hist) < period + 1:
@@ -166,6 +255,8 @@ def create_stock_chart(ticker, period="3mo", name_map=None):
         if hist is None or len(hist) < 1:
             return None
         stock_name = (name_map or {}).get(ticker) or ticker.replace(".JK", "")
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
             subplot_titles=(f'{stock_name} ({ticker.replace(".JK", "")})', 'Volume'),
@@ -221,8 +312,7 @@ def process_single_stock(ticker, min_trading_value, price_threshold, num_consecu
 
 def scan_stocks_with_progress(tickers, min_trading_value=15_000_000_000, price_threshold=2.0, num_consecutive_days=2, include_indicators=False, name_map=None):
     filtered, failed = [], []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    progress_bar = st.progress(0); status_text = st.empty()
     total = len(tickers)
     for idx, t in enumerate(tickers):
         status_text.text(f"Scanning {t}... ({idx+1}/{total})")
@@ -233,68 +323,74 @@ def scan_stocks_with_progress(tickers, min_trading_value=15_000_000_000, price_t
         else:
             failed.append({'ticker': res['ticker'], 'error': res['error']})
         if (idx + 1) % 50 == 0:
-            time.sleep(1.0)  # throttle politely
+            time.sleep(1.0)
         progress_bar.progress((idx + 1) / max(total, 1))
-    progress_bar.empty()
-    status_text.empty()
+    progress_bar.empty(); status_text.empty()
     if failed:
         with st.expander(f"⚠️ {len(failed)} saham gagal dimuat (klik untuk detail)", expanded=False):
             st.dataframe(pd.DataFrame(failed), use_container_width=True, hide_index=True)
     return pd.DataFrame(filtered), failed
 
-# --------- Sidebar controls ----------
-st.sidebar.header("⚙️ Pengaturan Filter")
-
+# ---------- Sidebar Controls ----------
+st.sidebar.header("⚙️ Sumber Daftar Emiten")
 source_mode = st.sidebar.radio(
-    "Sumber Daftar Emiten",
-    options=["Auto", "IDX only", "Yahoo only"],
-    help="Auto: coba IDX dulu, jika gagal pakai Yahoo."
+    "Sumber",
+    options=["Auto", "Yahoo only", "IDX only", "Manual"],
+    help="Kalau Replit memblokir API, pakai 'Manual' lalu tempel/upload daftar kode."
 )
 
-if st.sidebar.button("🔄 Refresh Daftar Emiten"):
-    fetch_from_idx.clear()
-    fetch_from_yahoo.clear()
-    st.sidebar.success("Cache dibersihkan. Daftar akan diambil ulang.")
+manual_text = ""
+manual_file = None
+if source_mode == "Manual":
+    manual_file = st.sidebar.file_uploader("Upload CSV/XLSX (kolom ticker/kode/symbol)", type=["csv", "xlsx"])
+    manual_text = st.sidebar.text_area("Atau tempel kode (1 per baris)", height=120, placeholder="BBCA\nBBRI\nBMRI\n...")
+
+if st.sidebar.button("🔄 Clear Cache (fetch ulang)"):
+    fetch_from_yahoo_search_verbose.clear()
+    fetch_from_idx_verbose.clear()
+    st.sidebar.success("Cache dihapus, daftar akan diambil ulang.")
 
 with st.spinner("Mengambil daftar emiten..."):
-    SYMBOLS, NAME_MAP = resolve_tickers(source_mode)
+    SYMBOLS, NAME_MAP, DEBUG_MSGS = resolve_universe(source_mode, manual_text, manual_file)
 
-min_trading_value = st.sidebar.number_input(
-    "Nilai Transaksi Minimum (Miliar Rp)",
-    min_value=1.0, max_value=100.0, value=15.0, step=1.0,
-    help="Masukkan nilai dalam miliar rupiah"
-)
-price_threshold = st.sidebar.number_input(
-    "Threshold Kenaikan Harga (%)",
-    min_value=0.5, max_value=10.0, value=2.0, step=0.5,
-    help="Persentase kenaikan minimum per hari"
-)
-num_consecutive_days = st.sidebar.number_input(
-    "Jumlah Hari Berturut-turut",
-    min_value=2, max_value=5, value=2, step=1,
-    help="Jumlah hari berturut-turut yang harus naik"
-)
+# ---------- Debug panel ----------
+with st.expander("🔎 Debug koneksi & daftar emiten (opsional)"):
+    st.write(f"Total terdeteksi: **{len(SYMBOLS)}**")
+    if DEBUG_MSGS:
+        st.write("Log sumber:")
+        for m in DEBUG_MSGS[:20]:
+            st.write("•", m)
+    # quick connectivity test to Yahoo price for BBCA.JK
+    try:
+        _h = yf.Ticker("BBCA.JK").history(period="5d")
+        st.write(f"Tes harga BBCA.JK: rows={len(_h)} (>=1 artinya koneksi harga OK)")
+    except Exception as e:
+        st.write(f"Tes harga BBCA.JK gagal: {e}")
+    if SYMBOLS:
+        st.dataframe(pd.DataFrame({
+            "Symbol": SYMBOLS[:50],
+            "Name": [NAME_MAP.get(s, s.replace('.JK','')) for s in SYMBOLS[:50]]
+        }), use_container_width=True, hide_index=True)
+
+# ---------- Filter Screener ----------
+st.sidebar.header("⚙️ Pengaturan Filter")
+min_trading_value = st.sidebar.number_input("Nilai Transaksi Minimum (Miliar Rp)", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
+price_threshold = st.sidebar.number_input("Threshold Kenaikan Harga (%)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+num_consecutive_days = st.sidebar.number_input("Jumlah Hari Berturut-turut", min_value=2, max_value=5, value=2, step=1)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📊 Indikator Teknikal")
-include_indicators = st.sidebar.checkbox(
-    "Tampilkan Indikator Teknikal",
-    value=False,
-    help="Menampilkan RSI, SMA, EMA, dan Volume Trend (membutuhkan waktu scan lebih lama)"
-)
+include_indicators = st.sidebar.checkbox("Tampilkan Indikator Teknikal", value=False)
 if include_indicators:
-    st.sidebar.info("⚠️ Indikator teknikal membutuhkan data 3 bulan dan waktu scan lebih lama")
+    st.sidebar.info("⚠️ Perlu data 3 bulan, scan lebih lama")
 
-# Info box
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 📊 Informasi")
+st.sidebar.markdown("### ℹ️ Informasi")
 st.sidebar.markdown(f"**Total Saham Terdeteksi:** {len(SYMBOLS)}")
 if 'last_scan' in st.session_state:
     st.sidebar.markdown(f"**Scan Terakhir:** {st.session_state['last_scan'].strftime('%H:%M:%S')}")
 
-# --------- Main actions ----------
 st.markdown("---")
-
 min_trading_value_actual = int(min_trading_value * 1_000_000_000)
 
 if st.sidebar.button("🔍 Scan Saham", type="primary"):
@@ -307,9 +403,9 @@ if st.sidebar.button("🔍 Scan Saham", type="primary"):
 
 auto_refresh = st.sidebar.checkbox("Auto Refresh (5 menit)", value=False)
 if auto_refresh:
-    st.sidebar.info("Data akan di-refresh otomatis setiap 5 menit")
+    st.sidebar.info("Data di-refresh otomatis setiap 5 menit")
 
-# --------- Results table & charts (unchanged) ----------
+# ---------- Hasil ----------
 if 'results' in st.session_state and not st.session_state['results'].empty:
     df = st.session_state['results']
     st.success(f"✅ Ditemukan {len(df)} saham yang memenuhi kriteria!")
@@ -341,9 +437,7 @@ if 'results' in st.session_state and not st.session_state['results'].empty:
             i = r * cols_per_row + c
             if i < len(df):
                 row = df.iloc[i]
-                code = row['Kode']
-                name = row['Nama']
-                tkr = f"{code}.JK"
+                code = row['Kode']; name = row['Nama']; tkr = f"{code}.JK"
                 with cols[c]:
                     with st.expander(f"📈 {code} - {name}"):
                         with st.spinner(f"Memuat grafik {code}..."):
@@ -355,19 +449,19 @@ if 'results' in st.session_state and not st.session_state['results'].empty:
 elif 'results' in st.session_state and st.session_state['results'].empty:
     st.warning("⚠️ Tidak ada saham yang memenuhi kriteria pada scan terakhir.")
 else:
-    st.info("👈 Pilih sumber daftar emiten lalu klik 'Scan Saham' untuk memulai.")
+    st.info("👈 Pilih sumber daftar emiten (atau Manual) lalu klik 'Scan Saham' untuk memulai.")
 
-# Auto-refresh
+# ---------- Auto refresh ----------
 if auto_refresh and 'last_scan' in st.session_state:
     if (datetime.now() - st.session_state['last_scan']).total_seconds() >= 300:
         st.rerun()
 
-# Footer
+# ---------- Footer ----------
 st.markdown("---")
 st.markdown(
     """
     <div style='text-align: center; color: #666;'>
-        <small>Daftar emiten: IDX / Yahoo Finance • Data harga: Yahoo Finance • Update setiap 5 menit (jika auto-refresh aktif)</small>
+        <small>Sumber daftar: Yahoo / IDX / Manual • Data harga: Yahoo Finance • Update tiap 5 menit (jika auto-refresh)</small>
     </div>
     """,
     unsafe_allow_html=True
